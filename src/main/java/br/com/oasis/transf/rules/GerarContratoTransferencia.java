@@ -29,6 +29,26 @@ public class GerarContratoTransferencia implements RegraNegocioJava {
         }
     }
 
+    // Obtém mgeSession do request HTTP original via ThreadLocalWrapper (reflexão).
+    private static String getMgeSession() {
+        try {
+            Class<?> tlw = Class.forName(
+                "br.com.sankhya.dwf.controller.util.ThreadLocalWrapper");
+            Object req = tlw.getMethod("getRequest").invoke(null);
+            if (req != null) {
+                String mge = (String) req.getClass()
+                    .getMethod("getParameter", String.class)
+                    .invoke(req, "mgeSession");
+                if (mge != null && !mge.isEmpty()) return mge;
+            }
+        } catch (Exception ignored) {}
+        try {
+            JapeSession s = JapeSession.getCurrentSession();
+            if (s != null) return s.getSessionGlobalID();
+        } catch (Exception ignored) {}
+        return null;
+    }
+
     @Override
     public void executa(ContextoRegra contexto) throws Exception {
 
@@ -61,7 +81,7 @@ public class GerarContratoTransferencia implements RegraNegocioJava {
         BigDecimal numContrato = (BigDecimal) tcsconData.get("NUMCONTRATO");
 
         // [6] Invocar gerarPedidoComercializacao via HTTP interno
-        String mgeSession = JapeSession.getCurrentSession().getSessionGlobalID();
+        String mgeSession = getMgeSession();
         BigDecimal nuNotaMatriz = GerarPedidoService.gerar(resolveHost(), mgeSession, tcsconData);
 
         // [7] Gravar NUMCONTRATO no campo adicional do pedido
