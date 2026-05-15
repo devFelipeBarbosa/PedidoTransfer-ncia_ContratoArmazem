@@ -44,19 +44,12 @@ public class GerarContratoTransferencia implements RegraNegocioJava {
 
         BigDecimal codProdPA = itensMapeados.values().iterator().next();
 
-        // [5] Criar TCSCON + TCSPSC via JAPE
-        JapeSession.SessionHandle session = JapeSession.open();
-        BigDecimal numContrato;
-        Map<String, Object> tcsconData;
-        try {
-            tcsconData = ContratoArmazemService.criar(session, cabecalho, codProdPA);
-            numContrato = (BigDecimal) tcsconData.get("NUMCONTRATO");
-        } finally {
-            JapeSession.close(session);
-        }
+        // [5] Criar TCSCON + TCSPSC via EntityFacade JAPE
+        Map<String, Object> tcsconData = ContratoArmazemService.criar(cabecalho, codProdPA);
+        BigDecimal numContrato = (BigDecimal) tcsconData.get("NUMCONTRATO");
 
         // [6] Invocar gerarPedidoComercializacao via HTTP interno
-        String mgeSession = JapeSession.getCurrentSessionID();
+        String mgeSession = JapeSession.getCurrentSession().getSessionGlobalID();
         BigDecimal nuNotaMatriz = GerarPedidoService.gerar(HOST, mgeSession, tcsconData);
 
         // [7] Gravar NUMCONTRATO no campo adicional do pedido
@@ -138,7 +131,7 @@ public class GerarContratoTransferencia implements RegraNegocioJava {
         try {
             q.setParam("NUMCONTRATO", numContrato);
             q.setParam("NUNOTA",      nuNota);
-            q.nativeExecute(
+            q.update(
                 "UPDATE TGFCAB SET AD_NUMCONTRATO_TRANSF = {NUMCONTRATO}" +
                 " WHERE NUNOTA = {NUNOTA}"
             );

@@ -1,7 +1,6 @@
 package br.com.oasis.transf.service;
 
-import br.com.sankhya.jape.core.JapeSession;
-import br.com.sankhya.jape.dao.EntityDAO;
+import br.com.sankhya.jape.EntityFacade;
 import br.com.sankhya.jape.vo.DynamicVO;
 import br.com.sankhya.jape.vo.EntityVO;
 import java.math.BigDecimal;
@@ -13,97 +12,94 @@ import java.util.Map;
 public class ContratoArmazemService {
 
     // Valores fixos de negócio (confirmados no INSERT capturado no monitor)
-    private static final int    CODEMP          = 1;
-    private static final int    CODPARC         = 4;
-    private static final String ATIVO           = "S";
-    private static final String CIF_FOB         = "F";
-    private static final int    PADCLASS        = 88;
-    private static final int    CODMOEDA        = 0;
-    private static final int    CODCONTATO      = 1;
-    private static final String EXIGEPEDIDOPES  = "S";
-    private static final String MODALIDADE      = "C";
-    private static final String TIPOARM         = "A";
-    private static final String TIPO            = "M";
-    private static final String COBPROPORCAR    = "E";
+    private static final int    CODEMP         = 1;
+    private static final int    CODPARC        = 4;
+    private static final String ATIVO          = "S";
+    private static final String CIF_FOB        = "F";
+    private static final int    PADCLASS       = 88;
+    private static final int    CODMOEDA       = 0;
+    private static final int    CODCONTATO     = 1;
+    private static final String EXIGEPEDIDOPES = "S";
+    private static final String MODALIDADE     = "C";
+    private static final String TIPOARM        = "A";
+    private static final String TIPO           = "M";
+    private static final String COBPROPORCAR   = "E";
 
     private ContratoArmazemService() {}
 
     /**
-     * Cria TCSCON + TCSPSC na Matriz (CODEMP=1).
+     * Cria TCSCON + TCSPSC na Matriz (CODEMP=1) via EntityFacade JAPE.
      *
-     * @param session   JapeSession aberta no contexto da regra
      * @param pedido    Campos do Pedido da Filial (AD_* + CODNAT + CODCENCUS)
      * @param codProdPA CODPRODPA mapeado via ComposicaoUtil
-     * @return          Map com NUMCONTRATO e todos os campos do TCSCON (payload para GerarPedidoService)
+     * @return          Map com NUMCONTRATO e campos do TCSCON (payload para GerarPedidoService)
      */
-    public static Map<String, Object> criar(JapeSession.SessionHandle session,
-                                             Map<String, Object> pedido,
+    public static Map<String, Object> criar(Map<String, Object> pedido,
                                              BigDecimal codProdPA) throws Exception {
-        BigDecimal numContrato = inserirTcscon(session, pedido);
-        inserirTcspsc(session, numContrato, codProdPA);
+        BigDecimal numContrato = inserirTcscon(pedido);
+        inserirTcspsc(numContrato, codProdPA);
         return buildTcsconMap(numContrato, pedido, codProdPA);
     }
 
-    private static BigDecimal inserirTcscon(JapeSession.SessionHandle session,
-                                             Map<String, Object> pedido) throws Exception {
-        EntityDAO dao = EntityDAO.getInstance(session);
-        DynamicVO vo = new DynamicVO("TCSCON");
+    private static BigDecimal inserirTcscon(Map<String, Object> pedido) throws Exception {
+        EntityFacade facade = EntityFacade.getInstance("TCSCON");
+        EntityVO voEntity = facade.getDefaultValueObjectInstance("TCSCON");
+        DynamicVO vo = (DynamicVO) voEntity;
 
         // Campos fixos
-        vo.setField("CODEMP",         new BigDecimal(CODEMP));
-        vo.setField("CODPARC",        new BigDecimal(CODPARC));
-        vo.setField("ATIVO",          ATIVO);
-        vo.setField("CIF_FOB",        CIF_FOB);
-        vo.setField("PADCLASS",       new BigDecimal(PADCLASS));
-        vo.setField("CODMOEDA",       new BigDecimal(CODMOEDA));
-        vo.setField("CODCONTATO",     new BigDecimal(CODCONTATO));
-        vo.setField("EXIGEPEDIDOPES", EXIGEPEDIDOPES);
-        vo.setField("MODALIDADE",     MODALIDADE);
-        vo.setField("TIPOARM",        TIPOARM);
-        vo.setField("TIPO",           TIPO);
-        vo.setField("COBPROPORCAR",   COBPROPORCAR);
-        vo.setField("SITCONT",        "A");
-        vo.setField("DTCONTRATO",     new Timestamp(new Date().getTime()));
+        vo.setProperty("CODEMP",         new BigDecimal(CODEMP));
+        vo.setProperty("CODPARC",        new BigDecimal(CODPARC));
+        vo.setProperty("ATIVO",          ATIVO);
+        vo.setProperty("CIF_FOB",        CIF_FOB);
+        vo.setProperty("PADCLASS",       new BigDecimal(PADCLASS));
+        vo.setProperty("CODMOEDA",       new BigDecimal(CODMOEDA));
+        vo.setProperty("CODCONTATO",     new BigDecimal(CODCONTATO));
+        vo.setProperty("EXIGEPEDIDOPES", EXIGEPEDIDOPES);
+        vo.setProperty("MODALIDADE",     MODALIDADE);
+        vo.setProperty("TIPOARM",        TIPOARM);
+        vo.setProperty("TIPO",           TIPO);
+        vo.setProperty("COBPROPORCAR",   COBPROPORCAR);
+        vo.setProperty("SITCONT",        "A");
+        vo.setProperty("DTCONTRATO",     new Timestamp(new Date().getTime()));
 
         // Campos vindos dos AD_* do Pedido da Filial
-        vo.setField("CODSAF",        toBD(pedido.get("AD_CODSAF")));
-        vo.setField("UNICONVSC",     toBD(pedido.get("AD_UNICONVSC")));
-        vo.setField("CODTIPVENDA",   toBD(pedido.get("AD_CODTIPVENDA_CT")));
-        vo.setField("TIPOCONTRATO",  toStr(pedido.get("AD_TIPOCONTRATO")));
-        vo.setField("QTDNEG",        toBD(pedido.get("AD_QTDNEG_SC")));
-        vo.setField("VALNEGSC",      toBD(pedido.get("AD_VALNEGSC")));
-        vo.setField("DTINIENTREGA",  toTs(pedido.get("AD_DTINIENTREGA")));
-        vo.setField("DTTERMINO",     toTs(pedido.get("AD_DTTERMINO")));
-        vo.setField("PERCTOLEXCED",  toBD(pedido.get("AD_PERCTOLEXCED")));
-        vo.setField("TIPOTITULO",    toBD(pedido.get("AD_TIPOTITULO_CT")));
+        vo.setProperty("CODSAF",       toBD(pedido.get("AD_CODSAF")));
+        vo.setProperty("UNICONVSC",    toBD(pedido.get("AD_UNICONVSC")));
+        vo.setProperty("CODTIPVENDA",  toBD(pedido.get("AD_CODTIPVENDA_CT")));
+        vo.setProperty("TIPOCONTRATO", toStr(pedido.get("AD_TIPOCONTRATO")));
+        vo.setProperty("QTDNEG",       toBD(pedido.get("AD_QTDNEG_SC")));
+        vo.setProperty("VALNEGSC",     toBD(pedido.get("AD_VALNEGSC")));
+        vo.setProperty("DTINIENTREGA", toTs(pedido.get("AD_DTINIENTREGA")));
+        vo.setProperty("DTTERMINO",    toTs(pedido.get("AD_DTTERMINO")));
+        vo.setProperty("PERCTOLEXCED", toBD(pedido.get("AD_PERCTOLEXCED")));
+        vo.setProperty("TIPOTITULO",   toBD(pedido.get("AD_TIPOTITULO_CT")));
 
         // Herdados do cabeçalho do pedido
-        vo.setField("CODNAT",        toBD(pedido.get("CODNAT")));
-        vo.setField("CODCENCUS",     toBD(pedido.get("CODCENCUS")));
+        vo.setProperty("CODNAT",    toBD(pedido.get("CODNAT")));
+        vo.setProperty("CODCENCUS", toBD(pedido.get("CODCENCUS")));
 
-        EntityVO saved = dao.persist(vo);
-        return (BigDecimal) saved.getFieldValue("NUMCONTRATO");
+        facade.createEntity("TCSCON", voEntity);
+        return vo.asBigDecimal("NUMCONTRATO");
     }
 
-    private static void inserirTcspsc(JapeSession.SessionHandle session,
-                                       BigDecimal numContrato,
-                                       BigDecimal codProdPA) throws Exception {
-        EntityDAO dao = EntityDAO.getInstance(session);
-        DynamicVO vo = new DynamicVO("TCSPSC");
+    private static void inserirTcspsc(BigDecimal numContrato, BigDecimal codProdPA) throws Exception {
+        EntityFacade facade = EntityFacade.getInstance("TCSPSC");
+        EntityVO voEntity = facade.getDefaultValueObjectInstance("TCSPSC");
+        DynamicVO vo = (DynamicVO) voEntity;
 
-        vo.setField("NUMCONTRATO",   numContrato);
-        vo.setField("CODPROD",       codProdPA);
-        vo.setField("SITPROD",       "A");
-        vo.setField("IMPRNOTA",      "S");
-        vo.setField("IMPROS",        "N");
-        vo.setField("LIMITANTE",     "N");
-        vo.setField("PRODPRINC",     "N");
-        vo.setField("QTDEPREVISTA",  BigDecimal.ZERO);
-        vo.setField("VLRUNIT",       BigDecimal.ZERO);
-        vo.setField("CODUSUALTREG",  BigDecimal.ZERO);
-        vo.setField("DHALTREG",      new Timestamp(new Date().getTime()));
+        vo.setProperty("NUMCONTRATO",  numContrato);
+        vo.setProperty("CODPROD",      codProdPA);
+        vo.setProperty("SITPROD",      "A");
+        vo.setProperty("IMPRNOTA",     "S");
+        vo.setProperty("IMPROS",       "N");
+        vo.setProperty("LIMITANTE",    "N");
+        vo.setProperty("PRODPRINC",    "N");
+        vo.setProperty("QTDEPREVISTA", BigDecimal.ZERO);
+        vo.setProperty("VLRUNIT",      BigDecimal.ZERO);
+        vo.setProperty("CODUSUALTREG", BigDecimal.ZERO);
+        vo.setProperty("DHALTREG",     new Timestamp(new Date().getTime()));
 
-        dao.persist(vo);
+        facade.createEntity("TCSPSC", voEntity);
     }
 
     private static Map<String, Object> buildTcsconMap(BigDecimal numContrato,

@@ -2,7 +2,7 @@ package br.com.oasis.transf.util;
 
 import java.io.*;
 import java.net.HttpURLConnection;
-<parameter name="content">import java.net.URL;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 public class HttpUtil {
