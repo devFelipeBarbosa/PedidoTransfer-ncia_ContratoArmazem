@@ -15,7 +15,7 @@ import java.util.Map;
 public class GerarContratoTransferencia implements RegraNegocioJava {
 
     // Endereço base do servidor — localhost pois a regra roda server-side
-    private static final String HOST = "http://localhost:8261";
+    private static final String HOST = "http://localhost:8080";
 
     @Override
     public void executa(ContextoRegra contexto) throws Exception {
