@@ -44,8 +44,8 @@ public class GerarContratoTransferencia implements RegraNegocioJava {
 
         BigDecimal codProdPA = itensMapeados.values().iterator().next();
 
-        // [5] Criar TCSCON + TCSPSC via EntityFacade JAPE
-        Map<String, Object> tcsconData = ContratoArmazemService.criar(cabecalho, codProdPA);
+        // [5] Criar TCSCON + TCSPSC via SQL direto
+        Map<String, Object> tcsconData = ContratoArmazemService.criar(contexto, cabecalho, codProdPA);
         BigDecimal numContrato = (BigDecimal) tcsconData.get("NUMCONTRATO");
 
         // [6] Invocar gerarPedidoComercializacao via HTTP interno
