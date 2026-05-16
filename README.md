@@ -3,11 +3,10 @@
 Personalização Sankhya ERP que, ao confirmar um **Pedido de Transferência** na Filial,
 gera automaticamente:
 
-1. **Contrato de Armazenagem** (`TCSCON` + `TCSPSC`) na Matriz
-2. **Pedido de Compra de Comercialização** (`TGFCAB`/`TGFITE`) vinculado ao contrato
+1. **Contrato de Armazenagem** (`TCSCON` + `TCSPSC`) na Matriz — sincronamente
+2. **Pedido de Compra de Comercialização** (`TGFCAB`/`TGFITE`) vinculado ao contrato — **assincronamente** (Lançador agendado)
 
-A geração roda como **Regra de Negócio (`IRegra` / `RegraNegocioJava`)** acionada na TOP do
-pedido de transferência (regra "15-CONTRATO/PEDIDO TRANSFERÊNCIA").
+A confirmação responde em **<1s**. O Pedido Matriz é gerado em background, com latência de 15-30s.
 
 ---
 
@@ -15,8 +14,45 @@ pedido de transferência (regra "15-CONTRATO/PEDIDO TRANSFERÊNCIA").
 
 - **Build:** `4.35b491`
 - **JAPE:** `4.36b32`
-- **Banco:** Oracle
+- **WS / Cuckoo:** `sanws-4.36b43`
+- **Banco:** Oracle 12c+
 - **App server:** WildFly + tinyejb
+
+---
+
+## Arquitetura
+
+```
+[Confirmação Pedido Filial — Central de Notas]
+       │
+       ▼
+[Regra GerarContratoTransferencia — síncrona, <500ms]
+   • valida pré-condições (CODEMP=4, flag AD_GERCONTRTRANSF='S', sem contrato já gerado)
+   • mapeia composição (processo 40 — Beneficiamento Filial)
+   • ContratoArmazemService.criar()  → cria TCSCON + TCSPSC via EntityFacade
+   • UPDATE TGFCAB Filial: AD_NUMCONTRATO_TRANSF
+   • INSERT AD_GERAPEDMATRIZ (STATUS='P')
+   • COMMIT, retorna mensagem ao usuário
+       │
+       ▼
+[Resposta ao usuário em <1s]
+
+─────────────── async (Cuckoo / ScheduledAction, a cada 15s) ───────────────
+
+[GerarPedidoMatrizLancador.onTime]
+   • abre JapeSession + EntityFacade (gerenciado pelo Cuckoo)
+   • SELECT FOR UPDATE SKIP LOCKED da fila (lote de 10)
+   • por item:
+       - JapeSessionContext.putProperty("usuario_logado", codusu)
+       - registra ServiceContext mock no ThreadLocal (evita NPE em CACHelper.gerarArquivoEDI)
+       - ArmazensGeraisHelper.criarNotaComercializacao()
+       - UPDATE TGFCAB Matriz: CODVEND=9 (Comprador)
+       - UPDATE AD_GERAPEDMATRIZ: STATUS='S', NUNOTAMATRIZ
+     em catch:
+       - tentativas+1 < max → STATUS='R' (reprocessar)
+       - senão              → STATUS='E' (erro fatal)
+       - fallback: se nota Matriz foi criada apesar do erro pós-confirmaNota, marca como sucesso
+```
 
 ---
 
@@ -25,14 +61,20 @@ pedido de transferência (regra "15-CONTRATO/PEDIDO TRANSFERÊNCIA").
 ```
 src/main/java/br/com/oasis/transf/
 ├── rules/
-│   └── GerarContratoTransferencia.java      Regra (adapter — ponto de entrada)
+│   └── GerarContratoTransferencia.java      Regra (adapter — ponto de entrada Filial)
 ├── service/
-│   ├── ContratoArmazemService.java          Cria TCSCON + TCSPSC (autonomous TX)
-│   └── GerarPedidoService.java              Chama ArmazensGeraisHelper nativo
+│   ├── ContratoArmazemService.java          Cria TCSCON + TCSPSC via EntityFacade
+│   ├── FilaPedidoMatrizService.java         Manipula AD_GERAPEDMATRIZ (P/X/S/E/R)
+│   └── GerarPedidoService.java              ArmazensGeraisHelper + UPDATE CODVEND
+├── lancador/
+│   └── GerarPedidoMatrizLancador.java       ScheduledAction (Cuckoo) — gera pedido async
 └── util/
-    ├── TLogCatcher.java                     Logger arquivo (padrão Bruna)
+    ├── TLogCatcher.java                     Logger arquivo
     ├── TLogConfiguration.java               ThreadLocal path/fileName
     └── TLogType.java                        Enum INFO/ERROR
+
+db/
+└── AD_GERAPEDMATRIZ.sql                     DDL tabela fila + sequence + index
 
 build.gradle                                  Java 8, encoding UTF-8
 libs/                                         JARs Sankhya (gitignored)
@@ -40,235 +82,266 @@ libs/                                         JARs Sankhya (gitignored)
 
 ---
 
-## Pré-condições para a regra disparar
+## Tabela de Fila — `AD_GERAPEDMATRIZ`
 
-Campos no `TGFCAB` do pedido de transferência (Filial):
+State machine: `P` → `X` → (`S` | `E` | `R` → reprocessa → `S` | `E`)
 
-| Campo                  | Tipo         | Função                                         |
-|------------------------|--------------|------------------------------------------------|
-| `CODEMP`               | NUMBER       | Deve ser **4** (Filial)                        |
-| `AD_GERCONTRTRANSF`    | VARCHAR(1)   | Flag liga/desliga (`'S'` = gera)               |
-| `AD_NUMCONTRATO_TRANSF`| NUMBER       | Vazio (preenchido após geração; protege duplicata) |
-| `AD_CODSAF`            | NUMBER       | Código da Safra                                |
-| `AD_UNICONVSC`         | NUMBER       | Unidade de Conversão SC                        |
-| `AD_CODTIPVENDA_CT`    | NUMBER       | Tipo de Venda do Contrato                      |
-| `AD_TIPOCONTRATO`      | VARCHAR      | Tipo (Exclusivo / Não Exclusivo)               |
-| `AD_TIPCON`            | VARCHAR(1)   | **'V'**=Venda Fixada, **'C'**=Compra Fixada, **'F'**=Compra a Fixar, **'B'**=Bolsa |
-| `AD_QTDNEG_SC`         | NUMBER       | Quantidade Negociada                           |
-| `AD_VALNEGSC`          | NUMBER       | Valor Negociado por SC                         |
-| `AD_DTINIENTREGA`      | DATE         | Data Início Entrega                            |
-| `AD_DTTERMINO`         | DATE         | Data Término                                   |
-| `AD_PERCTOLEXCED`      | NUMBER       | % Tolerância Excedente                         |
-| `AD_TIPOTITULO_CT`     | NUMBER       | Tipo de Título                                 |
+| Coluna | Tipo | Notas |
+|---|---|---|
+| `NUFILA` | NUMBER(10) PK | gerado por `SEQ_AD_GERAPEDMATRIZ.NEXTVAL` |
+| `NUNOTAORIG` | NUMBER(10) NOT NULL | NUNOTA Pedido Filial |
+| `NUMCONTRATO` | NUMBER(10) NOT NULL **UNIQUE** | idempotência forte — 1 contrato = 1 linha |
+| `NUNOTAMATRIZ` | NUMBER(10) NULL | preenchido após sucesso |
+| `STATUS` | VARCHAR2(1) NOT NULL | `P`endente / Processando (`X`) / `S`ucesso / `E`rro fatal / `R`eprocessar |
+| `TENTATIVAS` | NUMBER(3) DEFAULT 0 | |
+| `MAX_TENTATIVAS` | NUMBER(3) DEFAULT 5 | |
+| `MSG_ERRO` | VARCHAR2(4000) NULL | |
+| `DHCRIACAO` | TIMESTAMP | enfileiramento |
+| `DHPROC` | TIMESTAMP NULL | última tentativa |
+| `UUIDFILA` | VARCHAR2(36) NOT NULL | rastro fim-a-fim |
+| `CODUSU` | NUMBER(10) | quem confirmou Filial |
+
+Index `IDX_AD_GERAPEDMATRIZ_STATUS (STATUS, DHCRIACAO)` acelera SELECT pendentes do Lançador.
 
 ---
 
-## Fluxo de Execução
+## Pré-condições da Regra (Pedido Filial)
 
-```
-Confirmação do Pedido (Central)
-        │
-        ▼
-CACSPBean.confirmarNota → RegraDinamicaHelper.executarRegrasDaTop
-        │
-        ▼
-GerarContratoTransferencia.executa  ← AQUI
-        │
-        ├─ lerCabecalho(NUNOTA)            SELECT TGFCAB com 16 campos AD_*
-        ├─ valida CODEMP=4
-        ├─ valida AD_GERCONTRTRANSF='S'
-        ├─ valida não há contrato gerado
-        │
-        ├─ mapearItensComComposicao()      1 JOIN único (sem N+1)
-        │     SELECT TGFITE × TPRLMP × TPRATV × TPRPRC (processo 40, versão mais recente)
-        │
-        ├─ ContratoArmazemService.criar()
-        │     ├─ reservarSequencia()       SELECT+UPDATE TGFNUM (ARQUIVO='TCSCON')
-        │     └─ PRAGMA AUTONOMOUS_TRANSACTION:
-        │           INSERT TCSCON          (NUMCONTRATO ... TIPCON ...)
-        │           INSERT TCSPSC          (produto PA do contrato)
-        │           COMMIT                 (visibilidade pro próximo passo)
-        │
-        ├─ GerarPedidoService.gerar(NUMCONTRATO, TIPCON)
-        │     └─ ArmazensGeraisHelper.criarNotaComercializacao(jdbc, dwf, num, params, null, cotacao)
-        │           └─ Cadeia nativa: cria TGFCAB+TGFITE Matriz (TOP=3030100, LOCAL=3006)
-        │
-        └─ atualizarNumContrato()          UPDATE TGFCAB.AD_NUMCONTRATO_TRANSF
-```
+| Campo `TGFCAB` | Tipo | Função |
+|---|---|---|
+| `CODEMP` | NUMBER | Deve ser **4** (Filial) |
+| `AD_GERCONTRTRANSF` | VARCHAR(1) | Flag liga/desliga (`'S'` = gera) |
+| `AD_NUMCONTRATO_TRANSF` | NUMBER | Vazio — preenchido após geração (proteção contra duplicata) |
+| `AD_CODSAF` | NUMBER | Código da Safra |
+| `AD_UNICONVSC` | NUMBER | Unidade de Conversão SC |
+| `AD_CODTIPVENDA_CT` | NUMBER | Tipo de Venda do Contrato |
+| `AD_TIPOCONTRATO` | VARCHAR | Exclusivo / Não Exclusivo |
+| `AD_TIPCON` | VARCHAR(1) | `V`/`C`/`F`/`B` |
+| `AD_QTDNEG_SC` | NUMBER | Quantidade Negociada |
+| `AD_VALNEGSC` | NUMBER | Valor Negociado por SC |
+| `AD_DTINIENTREGA` | DATE | Data Início Entrega |
+| `AD_DTTERMINO` | DATE | Data Término |
+| `AD_PERCTOLEXCED` | NUMBER | % Tolerância Excedente |
+| `AD_TIPOTITULO_CT` | NUMBER | Tipo de Título |
 
 ---
 
 ## Decisões Técnicas
 
-### 1. Sem REST/HTTP
+### 1. Processamento async via `ScheduledAction` (Cuckoo)
 
-**Antes:** `HttpUtil.post()` em `http://127.0.0.1:8080/armazem/service.sbr?serviceName=ContratosArmazemGeralSP.gerarPedidoComercializacao`
+**Antes:** Regra síncrona chamava `ArmazensGeraisHelper.criarNotaComercializacao` direto.
+Tempo total da confirmação: **~7s** (4500ms "Personalizado" no medidor do Sankhya).
 
-**Problemas:**
-- 11.45s no "Tempo de Código Personalizado" (84.5% do tempo total) — aviso de performance da plataforma
-- Stack: socket → filter chain → auth → JSON parse → SP → return → JSON serialize → parse local
-- Dependência de `mgeSession` capturada via reflexão em `ThreadLocalWrapper`
-- Dependência de porta do WildFly (resolvida via JMX MBean)
+**Agora:** Regra só cria TCSCON + insere fila. Pedido Matriz roda em Lançador Cuckoo.
+Tempo da confirmação: **<1s**. Tempo do helper migra pra "Nativo" no medidor.
 
-**Agora:** chamada direta ao mesmo método interno que o SP invoca:
+Padrão enterprise: tabela própria, state machine, lock pessimista, retry, idempotência.
+
+### 2. Criação de TCSCON via `EntityFacade.createEntity`
+
+Em vez de INSERT PL/SQL manual:
+- `EntityFacade.createEntity("ContratoArmazenagemGeral", vo)` — Sankhya gera `NUMCONTRATO` via TGFNUM atomicamente
+- Setar `CODPROD` + `QTDEPREVISTA` no VO do contrato → `ContratoArmazenagemGeralListener.afterInsert` chama `insertAlteraCodProd(vo)` que **cria TCSPSC automaticamente** com `PRODPRINC='S'`
+
+### 3. Lock pessimista cluster-safe
+
+```sql
+SELECT NUFILA, ... FROM AD_GERAPEDMATRIZ
+ WHERE STATUS IN ('P','R') AND TENTATIVAS < MAX_TENTATIVAS
+   AND ROWNUM <= 10
+ ORDER BY DHCRIACAO
+ FOR UPDATE SKIP LOCKED        -- Oracle 12c+
+```
+
+2 Lançadores em nós diferentes → pegam linhas disjuntas, sem duplicar pedido.
+
+### 4. ServiceContext mock — workaround NPE de EDI
+
+`ConfirmacaoNotaHelper.confirmaNota` chama `ServiceContext.getCurrent()` que retorna `null` em thread Cuckoo. Helper passa null pra `CACHelper.gerarArquivoEDI(Collection, ServiceContext)` → `ctx.getBodyElement()` → **NPE**.
+
+**Bloco EDI não pula por property JapeSession** (bytecode confirmado: pula só se nota for NFE/NFSE/CTE/NFCom).
+
+Solução: registrar `ServiceContext` mock no ThreadLocal interno via reflection:
 ```java
-ArmazensGeraisHelper.criarNotaComercializacao(jdbc, dwf, numContrato, params, null, cotacao)
+Constructor<?> c = ServiceContext.class.getDeclaredConstructor(HttpServletRequest.class);
+c.setAccessible(true);
+Object mock = c.newInstance(new Object[]{ null });
+Field field = ServiceContext.class.getDeclaredField("current");
+field.setAccessible(true);
+((ThreadLocal<Object>) field.get(null)).set(mock);
 ```
 
-Descoberto por bytecode inspection de `ContratosArmazemGeralSPBean.gerarPedidoComercializacao`
-(linhas 481-491 do `.class`).
+O construtor `ServiceContext(null)` já inicializa `bodyElement = new Element("responseBody")` — não-null. Reflection usada pra evitar dependência `javax.servlet` no compile-time.
 
-### 2. AUTONOMOUS_TRANSACTION para TCSCON
+`finally` chama `limparServiceContextMock()` para evitar vazamento entre execuções.
 
-Garante que o INSERT do contrato é **commitado antes** da chamada que gera o pedido,
-evitando "contrato não encontrado" se a chamada nativa abrir nova TX. PL/SQL block:
+### 5. CODVEND=9 na nota Matriz
 
+`criarNotaComercializacao` não recebe CODVEND como param. UPDATE direto após criação:
 ```sql
-DECLARE PRAGMA AUTONOMOUS_TRANSACTION; BEGIN
-  INSERT INTO TCSCON (...) VALUES (...);
-  INSERT INTO TCSPSC (...) VALUES (...);
-  COMMIT;
-END;
+UPDATE TGFCAB SET CODVEND = 9 WHERE NUNOTA = ?
 ```
-
-### 3. NUMCONTRATO via TGFNUM
-
-Reserva sequência igual o ERP nativo:
-```sql
-SELECT NVL(ULTCOD,0)+1 FROM TGFNUM WHERE ARQUIVO='TCSCON' AND CODEMP=1 AND SERIE='.'
-UPDATE TGFNUM SET ULTCOD=... WHERE ARQUIVO='TCSCON' AND CODEMP=1 AND SERIE='.'
-```
-
-### 4. Mapeamento de Composição (processo 40)
-
-Cada `CODPROD` do pedido (matéria-prima) precisa de um `CODPRODPA` (produto acabado)
-mapeado no **Processo 40 — Beneficiamento Filial**.
-
-**Versão única** (eliminou N+1):
-```sql
-SELECT ITE.CODPROD CODPRODMP, COMP.CODPRODPA
-  FROM TGFITE ITE
-  LEFT JOIN (
-    SELECT MP.CODPRODMP, MP.CODPRODPA,
-           ROW_NUMBER() OVER (PARTITION BY MP.CODPRODMP ORDER BY PRC.VERSAO DESC) RN
-      FROM TPRLMP MP
-      JOIN TPRATV ATV ON ATV.IDEFX = MP.IDEFX
-      JOIN TPRPRC PRC ON PRC.IDPROC = ATV.IDPROC
-     WHERE PRC.CODPRC = 40
-  ) COMP ON COMP.CODPRODMP = ITE.CODPROD AND COMP.RN = 1
- WHERE ITE.NUNOTA = {NUNOTA}
-```
-
-### 5. Cotação para TIPCON='B' (Bolsa)
-
-Quando o contrato é cotado em moeda alternativa, replica query nativa de TSICOT:
-```sql
-SELECT TSICOT.COTACAO FROM TSICOT
- WHERE TSICOT.CODMOEDA = (SELECT CON1.PPAUTASC FROM TCSCON CON1 WHERE CON1.NUMCONTRATO = ?)
-   AND TSICOT.DTMOV = (SELECT MAX(DTMOV) FROM TSICOT WHERE CODMOEDA = ...)
-```
-
-Para TIPCON='V'/'C'/'F' → cotação = 0.
 
 ### 6. Logging — padrão `TLogCatcher`
 
-`TLogConfiguration` armazena path/fileName em `ThreadLocal` (thread-safe entre regras paralelas).
-`TLogCatcher.logInfo/logError` grava em `<repositorio>/personalizacao/log<YYYY-MM-DD>-<nome>.txt`.
+`TLogConfiguration` armazena path/fileName em ThreadLocal. `TLogCatcher.logInfo/logError` grava em `<repo>/personalizacao/log<YYYY-MM-DD>-<nome>.txt`.
 
-- `executa()` configura ThreadLocal, faz `try/catch/logError/throw`, `finally { clear() }`
-- Cada método com try/catch captura erros pontuais (lerCabecalho, mapearItens, etc.)
-- Diretório criado via `mkdirs()` no primeiro write
+Logs separados Regra (`GerarContratoTransferencia`) vs Lançador (`GerarPedidoMatrizLancador`).
 
 ### 7. Encoding UTF-8
 
-`build.gradle`:
-```gradle
-compileJava.options.encoding = 'UTF-8'
-```
-
-Default do Gradle no Windows era `windows-1252` → caracteres acentuados ("Armazém", "já")
-viravam mojibake ("ArmazÃ©m", "jÃ¡") nas mensagens da plataforma.
+`compileJava.options.encoding = 'UTF-8'` evita mojibake em acentos.
 
 ---
 
-## Constantes da Personalização
+## Constantes
 
-| Constante               | Valor       | Onde                          |
-|-------------------------|-------------|-------------------------------|
-| CODEMP Matriz contrato  | `1`         | `ContratoArmazemService`      |
-| CODPARC Matriz contrato | `4`         | `ContratoArmazemService`      |
-| PADCLASS                | `88`        | `ContratoArmazemService`      |
-| TIPOARM                 | `'A'`       | `ContratoArmazemService`      |
-| TIPO contrato           | `'M'`       | `ContratoArmazemService`      |
-| MODALIDADE              | `'C'`       | `ContratoArmazemService`      |
-| COBPROPORCAR            | `'E'`       | `ContratoArmazemService`      |
-| CIF_FOB                 | `'F'`       | `ContratoArmazemService`      |
-| EXIGEPEDIDOPES          | `'S'`       | `ContratoArmazemService`      |
-| CODTIPOPER pedido       | `3006`      | `GerarPedidoService`          |
-| CODLOCAL pedido         | `3030100`   | `GerarPedidoService`          |
-| CODEMP Filial (dispara) | `4`         | `GerarContratoTransferencia`  |
-| CODPRC composição       | `40`        | `GerarContratoTransferencia`  |
-
----
-
-## Build & Deploy
-
-```bash
-./gradlew jar
-# Gera: build/libs/oasis-transf-contrato-1.0.0.jar
-```
-
-Copiar JAR para a pasta de personalizações do Sankhya (ex: `<sankhya>/personalizacao/`)
-e fazer hot reload do módulo.
+| Constante | Valor | Onde |
+|---|---|---|
+| CODEMP Matriz (contrato/pedido) | `1` | `ContratoArmazemService` / `GerarPedidoService` |
+| CODPARC Matriz | `4` | `ContratoArmazemService` |
+| CODVEND Pedido Matriz | `9` (Comprador) | `GerarPedidoService` |
+| CODTIPOPER Pedido Matriz | `3006` | `GerarPedidoService` |
+| CODLOCAL Pedido Matriz | `3030100` | `GerarPedidoService` |
+| PADCLASS | `88` | `ContratoArmazemService` |
+| TIPOARM | `'A'` | `ContratoArmazemService` |
+| MODALIDADE | `'C'` | `ContratoArmazemService` |
+| COBPROPORCAR | `'E'` | `ContratoArmazemService` |
+| CIF_FOB | `'F'` | `ContratoArmazemService` |
+| CODEMP Filial (dispara regra) | `4` | `GerarContratoTransferencia` |
+| CODPRC composição | `40` | `GerarContratoTransferencia` |
+| LOTE Lançador | `10` itens / ciclo | `GerarPedidoMatrizLancador` |
+| MAX_TENTATIVAS | `5` | DDL default |
 
 ---
 
-## Troubleshooting
+## Setup Inicial (homologação / produção)
 
-Logs ficam em `<repositorio-sankhya>/personalizacao/log<YYYY-MM-DD>-GerarContratoTransferencia.txt`.
+1. **Aplicar DDL** (em ambiente Sankhya):
+   ```sql
+   @db/AD_GERAPEDMATRIZ.sql
+   ```
 
-Padrão sucesso esperado:
+2. **Build e copiar JAR**:
+   ```bash
+   ./gradlew clean jar
+   # build/libs/oasis-transf-contrato-1.0.0.jar
+   ```
+   Subir no **Repositório de Arquivos Sankhya**.
+
+3. **Cadastrar Tarefa Agendada** (tela `Configurações > Tarefas Agendadas`, Cuckoo):
+   - **Classe**: `br.com.oasis.transf.lancador.GerarPedidoMatrizLancador`
+   - **Intervalo**: 15 segundos
+   - **Ativa**: S
+
+4. **Hot reload do módulo Java** (ou restart WildFly se necessário).
+
+---
+
+## Verificação (Smoke Test)
+
+### Caminho feliz
+1. Confirmar Pedido Filial (CODEMP=4, TOP=1307, AD_GERCONTRTRANSF='S')
+2. Tempo de resposta deve ser **<1s**. Mensagem: "Contrato nº X criado. Pedido de Compra (Matriz) será gerado em background."
+3. `SELECT * FROM AD_GERAPEDMATRIZ ORDER BY DHCRIACAO DESC` → STATUS='P'
+4. Aguardar 15-30s
+5. Re-SELECT → STATUS='S', NUNOTAMATRIZ preenchido
+6. Verificar Pedido Matriz na Central: CODEMP=1, CODVEND=9, confirmado
+
+### Caminho falha (validação retry)
+1. Forçar erro (ex: apagar TCSPSC antes do Lançador rodar)
+2. STATUS='R' após 1ª falha → retry automático na próxima janela
+3. Após 5 falhas → STATUS='E', `MSG_ERRO` populado
+
+### Logs
+
+- Regra: `<repo>/personalizacao/log<YYYY-MM-DD>-GerarContratoTransferencia.txt`
+- Lançador: `<repo>/personalizacao/log<YYYY-MM-DD>-GerarPedidoMatrizLancador.txt`
+
+---
+
+## Operação — manutenção da fila
+
+### Reprocessar item específico (após corrigir causa raiz):
+```sql
+UPDATE AD_GERAPEDMATRIZ SET STATUS='R', TENTATIVAS=0, MSG_ERRO=NULL
+ WHERE NUFILA = :id;
+COMMIT;
 ```
-[INFO] Iniciando regra para NUNOTA=83985
-[INFO] Cabecalho lido. AD_GERCONTRTRANSF=S CODEMP=4 AD_TIPCON=C ...
-[INFO] Contrato 305 criado para NUNOTA=83985. Gerando pedido via ArmazensGeraisHelper nativo...
-[INFO] Chamando ArmazensGeraisHelper.criarNotaComercializacao NUMCONTRATO=305 TIPCON=C COTACAO=0
-[INFO] Pedido de compra NUNOTA=83986 gerado. Contrato=305
+
+### Listar pendentes / erros:
+```sql
+SELECT NUFILA, NUNOTAORIG, NUMCONTRATO, STATUS, TENTATIVAS, MSG_ERRO, DHCRIACAO
+  FROM AD_GERAPEDMATRIZ
+ WHERE STATUS IN ('P','X','R','E')
+ ORDER BY DHCRIACAO DESC;
 ```
 
-Erros frequentes e causas:
-
-| Mensagem                                                          | Causa                                                            |
-|-------------------------------------------------------------------|------------------------------------------------------------------|
-| `Falha ao converter para representação interna`                   | `getBigDecimal` em coluna texto (ex: `AD_TIPCON` é CHAR)         |
-| `Composição não encontrada no processo 40`                        | Produto sem mapeamento em TPRLMP/TPRATV/TPRPRC com CODPRC=40     |
-| `Contrato de Armazém nº X já gerado para este pedido`             | `AD_NUMCONTRATO_TRANSF` já preenchido — proteção contra duplicata|
-| `Geração ... permitida apenas para CODEMP=4 (Filial)`             | Tentativa de disparar em empresa errada                          |
+### Cancelar item manualmente:
+```sql
+UPDATE AD_GERAPEDMATRIZ SET STATUS='E', MSG_ERRO='Cancelado manualmente'
+ WHERE NUFILA = :id;
+COMMIT;
+```
 
 ---
 
 ## Tabelas Envolvidas
 
-| Tabela     | Papel                                              |
-|------------|----------------------------------------------------|
-| `TGFCAB`   | Pedido de transferência (Filial) + pedido matriz   |
-| `TGFITE`   | Itens dos pedidos                                  |
-| `TCSCON`   | Contrato de Armazenagem (criado)                   |
-| `TCSPSC`   | Produtos/Serviços do contrato (criado)             |
-| `TGFNUM`   | Numerador (NUMCONTRATO sequência)                  |
-| `TPRLMP`   | Lista de matérias-primas das fórmulas              |
-| `TPRATV`   | Atividades do processo                             |
-| `TPRPRC`   | Processos (versão mais recente)                    |
-| `TSICOT`   | Cotações (usado se TIPCON='B')                     |
+| Tabela | Papel |
+|---|---|
+| `TGFCAB` | Pedido Filial (origem) + Pedido Matriz (criado pelo Lançador) |
+| `TGFITE` | Itens dos pedidos |
+| `TCSCON` | Contrato de Armazenagem (criado pela Regra) |
+| `TCSPSC` | Produtos/Serviços do contrato (criado pelo listener) |
+| `TGFNUM` | Numerador (NUMCONTRATO sequência — gerenciado pelo Sankhya) |
+| `TPRLMP` / `TPRATV` / `TPRPRC` | Composição do produto (processo 40) |
+| `AD_GERAPEDMATRIZ` | Fila assíncrona (nova) |
 
 ---
 
 ## JARs do Classpath (compileOnly)
 
-- `SankhyaW-extensions.jar` — `RegraNegocioJava`, `ContextoRegra`, `QueryExecutor`
-- `jape-4.36b32.jar` — `EntityFacade`, `JdbcWrapper`, `NativeSql`
+- `SankhyaW-extensions.jar` — `RegraNegocioJava`, `ContextoRegra`, `QueryExecutor`, `org.cuckoo.core.ScheduledAction`
+- `jape-4.36b32.jar` — `EntityFacade`, `JdbcWrapper`, `NativeSql`, `JapeSession`, `JapeSessionContext`
 - `mge-modelcore-4.35b491.jar` — `EntityFacadeFactory`, `SWRepositoryUtils`
 - `mgearmazem-model-4.35b491.jar` — `ArmazensGeraisHelper.criarNotaComercializacao`
+- `sanws-4.36b43.jar` — `br.com.sankhya.ws.ServiceContext` (necessário pra mock do ThreadLocal)
+
+JARs não são versionados (ver `.gitignore`). Copiados de:
+- `<wildfly>/standalone/deployments/sankhyaw.ear/lib/` (sanws, jape)
+- `<wildfly>/standalone/deployments/erpcore.ear/web/mgearmazem-*.war` (mgearmazem)
+- Biblioteca interna `4.35b491` (mge-modelcore, mgearmazem-model)
+
+---
+
+## Próximos Passos
+
+- **Junho/2026 — Homologação com cliente.**
+  - Validar fluxo fim-a-fim com dados reais em homologação Turquesa
+  - Stress test: confirmar N pedidos Filial em paralelo e verificar fila + ausência de duplicação
+  - Confirmar latência aceitável do Lançador (15s padrão; ajustar se UX exigir <10s)
+  - Validar comportamento de retry quando contrato/pedido Matriz tem inconsistência (ex: parceiro sem CGC, TOP fora do ar)
+
+- **Fase 2 (após homologação)**
+  - Tela "Monitor Fila Pedido Matriz" pra suporte/operação (Construtor de Telas em cima de `AD_GERAPEDMATRIZ`)
+  - Notificação Sankhya ao usuário origem quando NUFILA atinge STATUS='E'
+  - Métricas/dashboard via BIA: latência média P50/P95, taxa de erro, throughput
+
+- **Eventual**
+  - Migrar `SELECT FOR UPDATE SKIP LOCKED` pra abstração caso projeto vá pra SQL Server (hoje hardcoded Oracle)
+  - Considerar Kafka/RabbitMQ se volume crescer (>1000 itens/min) — atualmente fila Oracle é suficiente
+
+---
+
+## Histórico de Mudanças Relevantes
+
+- **v1.0** (2026-05-15→16) — versão síncrona inicial
+- **v1.1** — refactor TCSCON via `EntityFacade.createEntity` (Sankhya gera NUMCONTRATO + TCSPSC via listener)
+- **v1.2** — otimizações performance (1 query cabeçalho+itens, remoção logInfo, cotação simplificada)
+- **v1.3** — CODVEND=9 (Comprador) na Matriz
+- **v2.0** — **arquitetura async** com `ScheduledAction` + fila `AD_GERAPEDMATRIZ` + ServiceContext mock pra EDI
 
 ---
 
